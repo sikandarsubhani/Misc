@@ -1,0 +1,134 @@
+#include <opencv2/opencv.hpp>
+#include <tensorflow/lite/interpreter.h>
+#include <tensorflow/lite/kernels/register.h>
+#include <tensorflow/lite/model.h>
+#include <tensorflow/lite/delegates/external/external_delegate.h>
+
+#include <iostream>
+#include <fstream>
+#include <chrono>
+#include <string>
+#include <vector>
+
+// Function to load the label map from a file where each line is a label
+std::vector<std::string> loadLabelMap(const std::string& labelFilePath) {
+    std::vector<std::string> labelMap;
+    std::ifstream file(labelFilePath);
+    std::string line;
+
+    while (std::getline(file, line)) {
+        labelMap.push_back(line);  // Add each line (label) to the vector
+    }
+
+    return labelMap;
+}
+
+int main(int argc, char** argv) {
+    // Parse arguments for input image, label map file, and delegate (if any)
+    std::string inputImage = "../test_image.jpg"; // Default input image path
+    std::string labelMapFile = "../labelmap.txt"; // Default label map file
+    std::string delegate = "";                    // Default delegate (none)
+
+    if (argc > 1) {
+        inputImage = argv[1];  // First argument: input image
+    }
+    if (argc > 2) {
+        labelMapFile = argv[2]; // Second argument: label map file
+    }
+    if (argc > 3) {
+        delegate = argv[3];     // Third argument: delegate (if provided)
+    }
+
+    // Load label map
+    std::vector<std::string> label2string = loadLabelMap(labelMapFile);
+    if (label2string.empty()) {
+        std::cerr << "Error: Failed to load label map from " << labelMapFile << std::endl;
+        return -1;
+    }
+
+    // Load TFLite model
+    const char* MODEL_PATH = "../models/ssd_mobilenet_v1_quant.tflite";
+    auto model = tflite::FlatBufferModel::BuildFromFile(MODEL_PATH);
+    tflite::ops::builtin::BuiltinOpResolver resolver;
+    std::unique_ptr<tflite::Interpreter> interpreter;
+    
+    tflite::InterpreterBuilder(*model, resolver)(&interpreter);
+
+    // Add external delegate if specified
+    if (!delegate.empty()) {
+        const tflite::ExternalDelegateOptions delegate_opts = {/*params here*/};
+        auto delegate_obj = TfLiteExternalDelegateCreate(&delegate_opts);
+        interpreter->ModifyGraphWithDelegate(delegate_obj);
+    }
+
+    interpreter->AllocateTensors();
+
+    // Get model input dimensions
+    auto input_details = interpreter->inputs();
+    auto output_details = interpreter->outputs();
+    int input_height = interpreter->tensor(input_details[0])->dims->data[1];
+    int input_width = interpreter->tensor(input_details[0])->dims->data[2];
+
+    // Load and preprocess input image
+    cv::Mat image = cv::imread(inputImage);
+    if (image.empty()) {
+        std::cerr << "Error: Unable to load image " << inputImage << std::endl;
+        return -1;
+    }
+
+    cv::Mat resized_image;
+    cv::resize(image, resized_image, cv::Size(input_width, input_height));
+    resized_image.convertTo(resized_image, CV_8UC3);  // Ensure it's in uint8 format
+
+    // Set input tensor
+    std::memcpy(interpreter->typed_input_tensor<uint8_t>(0), resized_image.data, resized_image.total() * resized_image.elemSize());
+
+    // Invoke model
+    auto invoke_start = std::chrono::high_resolution_clock::now();
+    interpreter->Invoke();
+    auto invoke_end = std::chrono::high_resolution_clock::now();
+
+    // Process output tensors
+    auto boxes = interpreter->typed_output_tensor<float>(0);
+    auto labels = interpreter->typed_output_tensor<float>(1);
+    auto scores = interpreter->typed_output_tensor<float>(2);
+    auto num_detections = interpreter->typed_output_tensor<float>(3)[0];
+
+    // Iterate through detected objects and draw boxes/labels
+    for (int i = 0; i < static_cast<int>(num_detections); i++) {
+        if (scores[i] > 0.5) {
+            int label_id = static_cast<int>(labels[i]);
+            if (label_id >= label2string.size()) {
+                continue;  // Skip if label_id is out of bounds
+            }
+            
+            float y0 = boxes[i * 4];
+            float x0 = boxes[i * 4 + 1];
+            float y1 = boxes[i * 4 + 2];
+            float x1 = boxes[i * 4 + 3];
+
+            int x_min = static_cast<int>(x0 * image.cols);
+            int y_min = static_cast<int>(y0 * image.rows);
+            int x_max = static_cast<int>(x1 * image.cols);
+            int y_max = static_cast<int>(y1 * image.rows);
+
+            // Draw bounding box and label
+            cv::rectangle(image, cv::Point(x_min, y_min), cv::Point(x_max, y_max), cv::Scalar(255, 0, 0), 2);
+            std::string label = label2string[label_id];
+            cv::putText(image, label, cv::Point(x_min, y_min - 5), cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 0, 255), 2);
+
+            std::cout << "Detected: " << label << " at [" << x_min << ", " << y_min << ", " << x_max << ", " << y_max << "]" << std::endl;
+        }
+    }
+
+    // Display FPS and inference time
+    auto invoke_time = std::chrono::duration_cast<std::chrono::milliseconds>(invoke_end - invoke_start).count();
+    std::string msg = "Invoke time: " + std::to_string(invoke_time) + " ms";
+    cv::putText(image, msg, cv::Point(0, 30), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(255, 255, 0), 2);
+
+    // Show image with detections
+    cv::imshow("Object Detection", image);
+    cv::waitKey(0);  // Wait for a key press before closing the window
+
+    return 0;
+}

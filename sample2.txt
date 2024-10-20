@@ -1,0 +1,150 @@
+#include <opencv2/opencv.hpp>
+#include <tensorflow/lite/interpreter.h>
+#include <tensorflow/lite/kernels/register.h>
+#include <tensorflow/lite/model.h>
+#include <tensorflow/lite/delegates/external/external_delegate.h>
+
+#include <iostream>
+#include <fstream>
+#include <chrono>
+#include <string>
+#include <map>
+#include <vector>
+
+// Define label map similar to label2string
+std::map<int, std::string> label2string = {
+    {0, "person"}, {1, "bicycle"}, {2, "car"}, {3, "motorcycle"}, {4, "airplane"},
+    {5, "bus"}, {6, "train"}, {7, "truck"}, {8, "boat"}, {9, "traffic light"},
+    {10, "fire hydrant"}, {12, "stop sign"}, {13, "parking meter"}, {14, "bench"},
+    {15, "bird"}, {16, "cat"}, {17, "dog"}, {18, "horse"}, {19, "sheep"},
+    {20, "cow"}, {21, "elephant"}, {22, "bear"}, {23, "zebra"}, {24, "giraffe"},
+    {26, "backpack"}, {27, "umbrella"}, {30, "handbag"}, {31, "tie"}, {32, "suitcase"},
+    {33, "frisbee"}, {34, "skis"}, {35, "snowboard"}, {36, "sports ball"}, {37, "kite"},
+    {38, "baseball bat"}, {39, "baseball glove"}, {40, "skateboard"}, {41, "surfboard"},
+    {42, "tennis racket"}, {43, "bottle"}, {45, "wine glass"}, {46, "cup"}, {47, "fork"},
+    {48, "knife"}, {49, "spoon"}, {50, "bowl"}, {51, "banana"}, {52, "apple"},
+    {53, "sandwich"}, {54, "orange"}, {55, "broccoli"}, {56, "carrot"}, {57, "hot dog"},
+    {58, "pizza"}, {59, "donut"}, {60, "cake"}, {61, "chair"}, {62, "couch"},
+    {63, "potted plant"}, {64, "bed"}, {66, "dining table"}, {69, "toilet"},
+    {71, "tv"}, {72, "laptop"}, {73, "mouse"}, {74, "remote"}, {75, "keyboard"},
+    {76, "cell phone"}, {77, "microwave"}, {78, "oven"}, {79, "toaster"}, {80, "sink"},
+    {81, "refrigerator"}, {83, "book"}, {84, "clock"}, {85, "vase"}, {86, "scissors"},
+    {87, "teddy bear"}, {88, "hair drier"}, {89, "toothbrush"}
+};
+
+int main(int argc, char** argv) {
+    // Parse arguments for input source and delegate (if any)
+    std::string input = "/dev/video0";
+    std::string delegate = "";
+    if (argc > 1) {
+        input = argv[1];
+    }
+    if (argc > 2) {
+        delegate = argv[2];
+    }
+
+    // Load TFLite model
+    const char* MODEL_PATH = "../models/ssd_mobilenet_v1_quant.tflite";
+    auto model = tflite::FlatBufferModel::BuildFromFile(MODEL_PATH);
+    tflite::ops::builtin::BuiltinOpResolver resolver;
+    std::unique_ptr<tflite::Interpreter> interpreter;
+    
+    tflite::InterpreterBuilder(*model, resolver)(&interpreter);
+    
+    // Add external delegate if specified
+    if (!delegate.empty()) {
+        const tflite::ExternalDelegateOptions delegate_opts = {/*params here*/};
+        auto delegate_obj = TfLiteExternalDelegateCreate(&delegate_opts);
+        interpreter->ModifyGraphWithDelegate(delegate_obj);
+    }
+
+    interpreter->AllocateTensors();
+
+    // Get model input dimensions
+    auto input_details = interpreter->inputs();
+    auto output_details = interpreter->outputs();
+    int input_height = interpreter->tensor(input_details[0])->dims->data[1];
+    int input_width = interpreter->tensor(input_details[0])->dims->data[2];
+
+    // Open video stream
+    cv::VideoCapture cap;
+    if (isdigit(input[0])) {
+        cap.open(std::stoi(input));
+    } else {
+        cap.open(input);
+    }
+
+    if (!cap.isOpened()) {
+        std::cerr << "Error: Unable to open video source: " << input << std::endl;
+        return -1;
+    }
+
+    int total_fps = 0;
+    double total_time = 0;
+    cv::Mat frame;
+    
+    while (cap.read(frame)) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Resize frame to model input size
+        cv::Mat resized;
+        cv::resize(frame, resized, cv::Size(input_width, input_height));
+        resized.convertTo(resized, CV_8UC3);  // Ensure it's in uint8 format
+
+        // Set input tensor
+        interpreter->typed_input_tensor<uint8_t>(0)[0] = *resized.data;
+
+        // Invoke model
+        auto invoke_start = std::chrono::high_resolution_clock::now();
+        interpreter->Invoke();
+        auto invoke_end = std::chrono::high_resolution_clock::now();
+
+        // Process output tensors
+        auto boxes = interpreter->typed_output_tensor<float>(0);
+        auto labels = interpreter->typed_output_tensor<float>(1);
+        auto scores = interpreter->typed_output_tensor<float>(2);
+        auto num_detections = interpreter->typed_output_tensor<float>(3)[0];
+
+        for (int i = 0; i < static_cast<int>(num_detections); i++) {
+            if (scores[i] > 0.5) {
+                int label_id = static_cast<int>(labels[i]);
+                float y0 = boxes[i * 4];
+                float x0 = boxes[i * 4 + 1];
+                float y1 = boxes[i * 4 + 2];
+                float x1 = boxes[i * 4 + 3];
+
+                int x_min = static_cast<int>(x0 * frame.cols);
+                int y_min = static_cast<int>(y0 * frame.rows);
+                int x_max = static_cast<int>(x1 * frame.cols);
+                int y_max = static_cast<int>(y1 * frame.rows);
+
+                // Draw bounding box and label
+                cv::rectangle(frame, cv::Point(x_min, y_min), cv::Point(x_max, y_max), cv::Scalar(255, 0, 0), 2);
+                std::string label = label2string[label_id];
+                cv::putText(frame, label, cv::Point(x_min, y_min - 5), cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 0, 255), 2);
+            }
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        total_time += std::chrono::duration<double>(end - start).count();
+        total_fps++;
+
+        // Show FPS and inference time
+        int fps = static_cast<int>(total_fps / total_time);
+        int invoke_time = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(invoke_end - invoke_start).count());
+        std::string msg = "FPS: " + std::to_string(fps) + "  Invoke time: " + std::to_string(invoke_time) + " ms";
+        cv::putText(frame, msg, cv::Point(0, 30), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(255, 255, 0), 2);
+
+        // Display frame
+        cv::imshow("Object Detection", frame);
+
+        if (cv::waitKey(1) == 'q') {
+            break;
+        }
+    }
+
+    cap.release();
+    cv::destroyAllWindows();
+
+    return 0;
+}
